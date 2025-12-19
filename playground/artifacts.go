@@ -65,6 +65,7 @@ type ArtifactsBuilder struct {
 	genesisDelay      uint64
 	applyLatestL2Fork *uint64
 	OpblockTime       uint64
+	customJWT         string
 }
 
 func NewArtifactsBuilder() *ArtifactsBuilder {
@@ -98,6 +99,11 @@ func (b *ArtifactsBuilder) GenesisDelay(genesisDelaySeconds uint64) *ArtifactsBu
 
 func (b *ArtifactsBuilder) OpBlockTime(blockTimeSeconds uint64) *ArtifactsBuilder {
 	b.OpblockTime = blockTimeSeconds
+	return b
+}
+
+func (b *ArtifactsBuilder) CustomJWT(jwtPath string) *ArtifactsBuilder {
+	b.customJWT = jwtPath
 	return b
 }
 
@@ -234,11 +240,23 @@ func (b *ArtifactsBuilder) Build() (*Artifacts, error) {
 		return nil, err
 	}
 
+	// Use custom JWT if provided, otherwise use default
+	jwtSecret := defaultJWTToken
+	if b.customJWT != "" {
+		jwtBytes, err := os.ReadFile(b.customJWT)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read custom JWT file %s: %w", b.customJWT, err)
+		}
+		jwtSecret = strings.TrimSpace(string(jwtBytes))
+		// Remove 0x prefix if present
+		jwtSecret = strings.TrimPrefix(jwtSecret, "0x")
+	}
+
 	err = out.WriteBatch(map[string]interface{}{
 		"testnet/config.yaml":                 func() ([]byte, error) { return convert(config) },
 		"testnet/genesis.ssz":                 state,
 		"genesis.json":                        gen,
-		"jwtsecret":                           defaultJWTToken,
+		"jwtsecret":                           jwtSecret,
 		"testnet/boot_enr.yaml":               "[]",
 		"testnet/deploy_block.txt":            "0",
 		"testnet/deposit_contract_block.txt":  "0",
