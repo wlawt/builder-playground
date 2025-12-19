@@ -27,7 +27,7 @@ type RollupBoost struct {
 func (r *RollupBoost) Run(service *Service, ctx *ExContext) {
 	service.
 		WithImage("docker.io/flashbots/rollup-boost").
-		WithTag("0.7.0").
+		WithTag("v0.7.11").
 		WithArgs(
 			"--rpc-host", "0.0.0.0",
 			"--rpc-port", `{{Port "authrpc" 8551}}`,
@@ -55,38 +55,71 @@ func (r *RollupBoost) Name() string {
 	return "rollup-boost"
 }
 
-type OpRbuilder struct {
+type Kafka struct {
+}
+
+func (k *Kafka) Run(service *Service, ctx *ExContext) {
+	service.WithImage("docker.io/confluentinc/confluent-local").
+		WithTag("7.7.1").
+		WithPort("kafka", 9092).
+		WithPort("controller", 9093).
+		WithEnv("KAFKA_LISTENERS", "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093").
+		WithEnv("KAFKA_ADVERTISED_LISTENERS", "PLAINTEXT://kafka:9092").
+		WithEnv("KAFKA_LISTENER_SECURITY_PROTOCOL_MAP", "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT").
+		WithEnv("KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR", "1").
+		WithEnv("KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS", "0").
+		WithEnv("KAFKA_TRANSACTION_STATE_LOG_MIN_ISR", "1").
+		WithEnv("KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR", "1").
+		WithEnv("KAFKA_AUTO_CREATE_TOPICS_ENABLE", "true").
+		WithVolume("kafka-data", "/var/lib/kafka/data").
+		WithReady(ReadyCheck{
+			Test:        []string{"CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"},
+			Interval:    2 * time.Second,
+			Timeout:     60 * time.Second,
+			Retries:     5,
+			StartPeriod: 5 * time.Second,
+		})
+}
+
+func (k *Kafka) Name() string {
+	return "kafka"
+}
+
+type TipsBuilder struct {
 	Flashblocks bool
 }
 
-func (o *OpRbuilder) Run(service *Service, ctx *ExContext) {
-	service.WithImage("ghcr.io/flashbots/op-rbuilder").
-		WithTag("sha-4f1931b").
+func (t *TipsBuilder) Run(service *Service, ctx *ExContext) {
+	// Tips builder uses a custom image built from https://github.com/base/tips.git#rblib
+	// The builder expects Kafka for UserOps messaging
+	service.WithImage("tips-builder").
+		WithTag("latest").
 		WithArgs(
-			"node",
+			"--chain", "/data/l2-genesis.json",
+			"--kafka-brokers", Connect("kafka", "kafka"),
+			"--kafka-topic", "tips-user-operation",
 			"--authrpc.port", `{{Port "authrpc" 8551}}`,
 			"--authrpc.addr", "0.0.0.0",
 			"--authrpc.jwtsecret", "/data/jwtsecret",
 			"--http",
 			"--http.addr", "0.0.0.0",
 			"--http.port", `{{Port "http" 8545}}`,
-			"--chain", "/data/l2-genesis.json",
-			"--datadir", "/data_op_reth",
+			"--datadir", "/data_tips_builder",
 			"--disable-discovery",
 			"--color", "never",
 			"--metrics", `0.0.0.0:{{Port "metrics" 9090}}`,
 			"--port", `{{Port "rpc" 30303}}`,
-			"--builder.enable-revert-protection",
 		).
 		WithArtifact("/data/jwtsecret", "jwtsecret").
 		WithArtifact("/data/l2-genesis.json", "l2-genesis.json").
-		WithVolume("data", "/data_op_reth")
+		WithVolume("data", "/data_tips_builder").
+		DependsOnHealthy("kafka")
 
 	if ctx.Bootnode != nil {
 		service.WithArgs("--trusted-peers", ctx.Bootnode.Connect())
 	}
 
-	if o.Flashblocks {
+	if t.Flashblocks {
 		service.WithArgs(
 			"--flashblocks.enabled",
 			"--flashblocks.addr", "0.0.0.0",
@@ -95,8 +128,8 @@ func (o *OpRbuilder) Run(service *Service, ctx *ExContext) {
 	}
 }
 
-func (o *OpRbuilder) Name() string {
-	return "op-rbuilder"
+func (t *TipsBuilder) Name() string {
+	return "tips-builder"
 }
 
 type FlashblocksRPC struct {
@@ -112,13 +145,13 @@ func (f *FlashblocksRPC) Run(service *Service, ctx *ExContext) {
 	}
 
 	if f.BaseOverlay {
-		// Base doesn't have built image, so we use mikawamp/base-reth-node
-		service.WithImage("docker.io/mikawamp/base-reth-node").
-			WithTag("latest").
+		service.WithImage("ghcr.io/base/node-reth-dev").
+			WithTag("main").
 			WithEntrypoint("/app/base-reth-node").
 			WithArgs(
 				"node",
 				"--websocket-url", websocketURL,
+				"--enable-metering",
 			)
 	} else {
 		service.WithImage("flashbots/flashblocks-rpc").
@@ -171,7 +204,7 @@ func (f *BProxy) Run(service *Service, ctx *ExContext) {
 		peers = append(peers, Connect(peer, "authrpc"))
 	}
 	service.WithImage("ghcr.io/flashbots/bproxy").
-		WithTag("v0.0.91").
+		WithTag("v0.1.2").
 		WithArgs(
 			"serve",
 			"--authrpc-backend", f.TargetAuthrpc,
@@ -382,7 +415,13 @@ func (o *OpGeth) Name() string {
 	return "op-geth"
 }
 
+func (o *OpGeth) Ready(instance *instance) error {
+	opGethURL := fmt.Sprintf("http://localhost:%d", instance.service.MustGetPort("http").HostPort)
+	return waitForFirstBlock(context.Background(), opGethURL, 60*time.Second)
+}
+
 var _ ServiceWatchdog = &OpGeth{}
+var _ ServiceReady = &OpGeth{}
 
 func (o *OpGeth) Watchdog(out io.Writer, instance *instance, ctx context.Context) error {
 	gethURL := fmt.Sprintf("http://localhost:%d", instance.service.MustGetPort("http").HostPort)
@@ -433,7 +472,7 @@ func (r *RethEL) Run(svc *Service, ctx *ExContext) {
 	// start the reth el client
 	svc.
 		WithImage("ghcr.io/paradigmxyz/reth").
-		WithTag("v1.4.8").
+		WithTag("v1.8.2").
 		WithEntrypoint("/usr/local/bin/reth").
 		WithArgs(
 			"node",
@@ -477,7 +516,13 @@ func (r *RethEL) Name() string {
 	return "reth"
 }
 
+func (r *RethEL) Ready(instance *instance) error {
+	elURL := fmt.Sprintf("http://localhost:%d", instance.service.MustGetPort("http").HostPort)
+	return waitForFirstBlock(context.Background(), elURL, 60*time.Second)
+}
+
 var _ ServiceWatchdog = &RethEL{}
+var _ ServiceReady = &RethEL{}
 
 func (r *RethEL) Watchdog(out io.Writer, instance *instance, ctx context.Context) error {
 	rethURL := fmt.Sprintf("http://localhost:%d", instance.service.MustGetPort("http").HostPort)
@@ -492,7 +537,7 @@ type LighthouseBeaconNode struct {
 func (l *LighthouseBeaconNode) Run(svc *Service, ctx *ExContext) {
 	svc.
 		WithImage("sigp/lighthouse").
-		WithTag("v7.0.0-beta.0").
+		WithTag("v8.0.0-rc.2").
 		WithEntrypoint("lighthouse").
 		WithArgs(
 			"bn",
@@ -551,7 +596,7 @@ func (l *LighthouseValidator) Run(service *Service, ctx *ExContext) {
 	// start validator client
 	service.
 		WithImage("sigp/lighthouse").
-		WithTag("v7.0.0-beta.0").
+		WithTag("v8.0.0-rc.2").
 		WithEntrypoint("lighthouse").
 		WithArgs(
 			"vc",

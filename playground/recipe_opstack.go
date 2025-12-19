@@ -12,6 +12,9 @@ type OpRecipe struct {
 	// rollup-boost on the sequencer and uses this URL as the external builder.
 	externalBuilder string
 
+	// externalBuilderJWT is the path to a JWT secret file to use for authenticating with the external builder
+	externalBuilderJWT string
+
 	// whether to enable the latest fork isthmus and when
 	enableLatestFork *uint64
 
@@ -49,6 +52,7 @@ func (o *OpRecipe) Description() string {
 func (o *OpRecipe) Flags() *flag.FlagSet {
 	flags := flag.NewFlagSet("opstack", flag.ContinueOnError)
 	flags.StringVar(&o.externalBuilder, "external-builder", "", "External builder URL")
+	flags.StringVar(&o.externalBuilderJWT, "external-builder-jwt", "", "Path to JWT secret file for external builder authentication")
 	flags.Var(&nullableUint64Value{&o.enableLatestFork}, "enable-latest-fork", "Enable latest fork isthmus (nil or empty = disabled, otherwise enabled at specified block)")
 	flags.Uint64Var(&o.blockTime, "block-time", defaultOpBlockTimeSeconds, "Block time to use for the rollup")
 	flags.Uint64Var(&o.batcherMaxChannelDuration, "batcher-max-channel-duration", 2, "Maximum channel duration to use for the batcher")
@@ -63,6 +67,9 @@ func (o *OpRecipe) Artifacts() *ArtifactsBuilder {
 	builder := NewArtifactsBuilder()
 	builder.ApplyLatestL2Fork(o.enableLatestFork)
 	builder.OpBlockTime(o.blockTime)
+	if o.externalBuilderJWT != "" {
+		builder.CustomJWT(o.externalBuilderJWT)
+	}
 	return builder
 }
 
@@ -93,16 +100,20 @@ func (o *OpRecipe) Apply(ctx *ExContext, artifacts *Artifacts) *Manifest {
 		svcManager.AddService("op-reth", &OpReth{})
 
 		externalBuilderRef = Connect("op-reth", "authrpc")
-	} else if o.externalBuilder == "op-rbuilder" {
-		svcManager.AddService("op-rbuilder", &OpRbuilder{
+	} else if o.externalBuilder == "tips-builder" {
+		// Add Kafka service for UserOps messaging
+		svcManager.AddService("kafka", &Kafka{})
+
+		// Add tips-builder service from the PR
+		svcManager.AddService("tips-builder", &TipsBuilder{
 			Flashblocks: o.flashblocks,
 		})
-		externalBuilderRef = Connect("op-rbuilder", "authrpc")
-	}
+		externalBuilderRef = Connect("tips-builder", "authrpc")
 
-	if o.flashblocks && o.externalBuilder == "op-rbuilder" {
-		// If flashblocks is enabled and using op-rbuilder, use it to deliver flashblocks
-		flashblocksBuilderURLRef = ConnectWs("op-rbuilder", "flashblocks")
+		if o.flashblocks {
+			// If flashblocks is enabled and using tips-builder, use it to deliver flashblocks
+			flashblocksBuilderURLRef = ConnectWs("tips-builder", "flashblocks")
+		}
 	}
 
 	if o.flashblocks {
